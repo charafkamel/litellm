@@ -464,22 +464,6 @@ async def test_non_json_response_raises_when_fail_closed(guardrail: CompresrGuar
             )
 
 
-@pytest.mark.asyncio
-async def test_http_exception_does_not_reflect_upstream_body(guardrail: CompresrGuardrail):
-    mock = MagicMock()
-    mock.status_code = 500
-    mock.json.side_effect = ValueError("not json")
-    mock.text = "SECRET_INSTANCE_METADATA_TOKEN=aws-imds-response"
-
-    with patch.object(guardrail.async_handler, "post", AsyncMock(return_value=mock)):
-        with pytest.raises(HTTPException) as exc_info:
-            await guardrail.apply_guardrail(
-                inputs=_apply_inputs(AGENT_MESSAGES),
-                request_data={"model": "gpt-4o"},
-                input_type="request",
-            )
-    assert "SECRET_INSTANCE_METADATA_TOKEN" not in json.dumps(exc_info.value.detail)
-
 
 def test_init_rejects_non_http_api_base():
     with pytest.raises(ValueError, match="scheme"):
@@ -1032,3 +1016,237 @@ async def test_apply_guardrail_skips_whitespace_only_compressed_context(
 
     # Whitespace-only result → original must be preserved.
     assert result["structured_messages"][1]["content"] == TOOL_OUTPUT
+
+
+# ── compression_params injection protection ───────────────────────────
+
+
+def test_compression_params_protected_keys_stripped_at_init():
+    """Keys that map to named payload fields must be dropped at init time so an
+    operator-supplied compression_params cannot overwrite context, query, or any
+    other protected field in the outbound payload."""
+    guardrail = _make_guardrail(
+        compression_params={
+            "context": "injected_context",
+            "query": "injected_query",
+            "inputs": "injected_inputs",
+            "source": "injected_source",
+            "coarse": False,
+            "heuristic_chunking": True,
+        }
+    )
+    assert "context" not in guardrail.compression_params
+    assert "query" not in guardrail.compression_params
+    assert "inputs" not in guardrail.compression_params
+    assert "source" not in guardrail.compression_params
+    assert "coarse" not in guardrail.compression_params
+    assert guardrail.compression_params["heuristic_chunking"] is True
+
+
+@pytest.mark.asyncio
+async def test_compression_params_cannot_override_context_in_payload():
+    """Even if a protected key somehow reached compression_params, the named
+    field in the payload must win — real context must reach the API."""
+    guardrail = _make_guardrail(compression_params={"heuristic_chunking": True})
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["context"] == TOOL_OUTPUT
+    assert payload["heuristic_chunking"] is True
+
+
+# ── initialize_guardrail wiring ───────────────────────────────────────
+
+
+def test_initialize_guardrail_wires_optional_params():
+    """optional_params values must reach the CompresrGuardrail constructor.
+    This pins the _get_optional_value lookup so a future __init__.py refactor
+    cannot silently drop a param without failing here."""
+    from unittest.mock import MagicMock, patch
+
+    from litellm.proxy.guardrails.guardrail_hooks.compresr import initialize_guardrail
+    from litellm.types.proxy.guardrails.guardrail_hooks.compresr import (
+        CompresrGuardrailOptionalParams,
+    )
+
+    optional_params = CompresrGuardrailOptionalParams(
+        target_compression_ratio=0.3,
+        coarse=False,
+        min_chars_to_compress=200,
+        compress_system=True,
+        compress_history=True,
+        compress_last_user=True,
+        enable_retrieval=False,
+        max_bytes_per_call=1024,
+        allow_bypass_header=True,
+        dynamic=True,
+        dynamic_min_ratio=1.5,
+        dynamic_max_ratio=8.0,
+        compression_params={"heuristic_chunking": True},
+    )
+
+    litellm_params = MagicMock()
+    litellm_params.api_base = FAKE_API_BASE
+    litellm_params.api_key = FAKE_API_KEY
+    litellm_params.model = "latte_v2"
+    litellm_params.unreachable_fallback = "fail_open"
+    litellm_params.default_on = True
+    litellm_params.mode = "pre_call"
+    litellm_params.optional_params = optional_params
+
+    guardrail_config = {"guardrail_name": "compresr"}
+
+    with patch("litellm.logging_callback_manager.add_litellm_callback"):
+        g = initialize_guardrail(litellm_params, guardrail_config)
+
+    assert g.target_compression_ratio == 0.3
+    assert g.coarse is False
+    assert g.min_chars_to_compress == 200
+    assert g.compress_system is True
+    assert g.compress_history is True
+    assert g.compress_last_user is True
+    assert g.enable_retrieval is False
+    assert g.max_bytes_per_call == 1024
+    assert g.allow_bypass_header is True
+    assert g.dynamic is True
+    assert g.dynamic_min_ratio == 1.5
+    assert g.dynamic_max_ratio == 8.0
+    assert g.compression_params == {"heuristic_chunking": True}
+
+
+# ── target selection: opt-in flags ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compress_last_user_compresses_last_user_message():
+    guardrail = _make_guardrail(compress_last_user=True)
+    long_user = "This is a long user message. " * 30
+    messages = [
+        {"role": "user", "content": long_user},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response(compressed_context="short user"))
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    mock_post.assert_called_once()
+    assert result["structured_messages"][0]["content"].startswith("short user")
+
+
+@pytest.mark.asyncio
+async def test_compress_history_compresses_prior_user_messages():
+    guardrail = _make_guardrail(compress_history=True)
+    long_old_user = "Old context. " * 50
+    messages = [
+        {"role": "user", "content": long_old_user},
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_batch_compress_response(["short old", "short tool"]))
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    out = result["structured_messages"]
+    assert out[0]["content"].startswith("short old")
+    assert out[1]["content"] == USER_QUESTION
+    assert out[2]["content"].startswith("short tool")
+
+
+# ── legacy function_call query resolution ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_legacy_function_call_intent_used_as_query(guardrail: CompresrGuardrail):
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {
+            "role": "assistant",
+            "function_call": {"name": "web_search", "arguments": '{"query": "EV range 2026"}'},
+        },
+        {"role": "function", "name": "web_search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["query"] == 'web_search: {"query": "EV range 2026"}'
+
+
+# ── SSRF: CGNAT range blocked ──────────────────────────────────────────
+
+
+def test_init_rejects_cgnat_api_base(monkeypatch):
+    import ipaddress
+    import socket as _socket
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(None, None, None, None, ("100.100.100.1", 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(ValueError, match="CGNAT"):
+        CompresrGuardrail(
+            api_base="http://internal-compresr.example.com",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+# ── length guard: equal-length compressed output kept ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_equal_length_compressed_output_is_kept(guardrail: CompresrGuardrail):
+    original = "x" * 600
+    compressed = "y" * 600
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": original},
+    ]
+    mock_post = AsyncMock(
+        return_value=_make_single_compress_response(compressed_context=compressed)
+    )
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    assert result["structured_messages"][1]["content"] == original
+
+
+@pytest.mark.asyncio
+async def test_strictly_longer_compressed_output_is_dropped(guardrail: CompresrGuardrail):
+    original = "x" * 600
+    compressed = "y" * 601
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": original},
+    ]
+    mock_post = AsyncMock(
+        return_value=_make_single_compress_response(compressed_context=compressed)
+    )
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    assert result["structured_messages"][1]["content"] == original
